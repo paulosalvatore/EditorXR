@@ -1,6 +1,7 @@
 #if UNITY_EDITOR
 using System;
 using System.Collections;
+using System.Linq;
 using System.Reflection;
 using UnityEditor.Experimental.EditorVR.Helpers;
 using UnityEditor.Experimental.EditorVR.Utilities;
@@ -32,7 +33,12 @@ namespace UnityEditor.Experimental.EditorVR.Core
             set
             {
                 if (s_ActiveView)
+                {
+                    if (s_ExistingSceneMainCamera && !s_ActiveView.m_CustomPreviewCamera && EditingContextManager.defaultContext.copyMainCameraImageEffectsToPresentationCamera)
+                        CopyImagesEffectsToCamera(value);
+
                     s_ActiveView.m_CustomPreviewCamera = value;
+                }
             }
             get
             {
@@ -122,6 +128,12 @@ namespace UnityEditor.Experimental.EditorVR.Core
 
         public Rect guiRect { get; private set; }
 
+        public static Vector2 MouseDelta;
+        public static Vector2 MouseScrollDelta;
+        public static bool LeftMouseButtonHeld;
+        public static bool MiddleMouseButtonHeld;
+        public static bool RightMouseButtonHeld;
+
         public static Coroutine StartCoroutine(IEnumerator routine)
         {
             if (s_ActiveView && s_ActiveView.m_CameraRig)
@@ -144,7 +156,8 @@ namespace UnityEditor.Experimental.EditorVR.Core
 
             s_ExistingSceneMainCamera = Camera.main;
             // TODO: Copy camera settings when changing contexts
-            if (EditingContextManager.defaultContext.copyExistingCameraSettings && s_ExistingSceneMainCamera && s_ExistingSceneMainCamera.enabled)
+            var defaultContext = EditingContextManager.defaultContext;
+            if (defaultContext.copyMainCameraSettings && s_ExistingSceneMainCamera && s_ExistingSceneMainCamera.enabled)
             {
                 GameObject cameraGO = EditorUtility.CreateGameObjectWithHideFlags(k_CameraName, HideFlags.HideAndDontSave);
                 m_Camera = ObjectUtils.CopyComponent(s_ExistingSceneMainCamera, cameraGO);
@@ -174,12 +187,6 @@ namespace UnityEditor.Experimental.EditorVR.Core
                 m_Camera.farClipPlane = farClipPlane;
             }
 
-            if (s_ExistingSceneMainCamera)
-            {
-                s_ExistingSceneMainCameraEnabledState = s_ExistingSceneMainCamera.enabled;
-                s_ExistingSceneMainCamera.enabled = false; // Disable existing MainCamera in the scene
-            }
-
             m_Camera.enabled = false;
             m_Camera.cameraType = CameraType.VR;
             m_Camera.useOcclusionCulling = false;
@@ -188,6 +195,14 @@ namespace UnityEditor.Experimental.EditorVR.Core
             m_Camera.transform.parent = m_CameraRig;
             m_CameraRig.position = headCenteredOrigin;
             m_CameraRig.rotation = Quaternion.identity;
+
+            if (s_ExistingSceneMainCamera && defaultContext.copyMainCameraImageEffectsToHMD)
+            {
+                CopyImagesEffectsToCamera(m_Camera);
+
+                s_ExistingSceneMainCameraEnabledState = s_ExistingSceneMainCamera.enabled;
+                s_ExistingSceneMainCamera.enabled = false; // Disable existing MainCamera in the scene
+            }
 
             m_ShowDeviceView = EditorPrefs.GetBool(k_ShowDeviceView, false);
             m_UseCustomPreviewCamera = EditorPrefs.GetBool(k_UseCustomPreviewCamera, false);
@@ -205,6 +220,31 @@ namespace UnityEditor.Experimental.EditorVR.Core
 
             if (viewEnabled != null)
                 viewEnabled();
+        }
+
+        static void CopyImagesEffectsToCamera(Camera targetCamera)
+        {
+            var targetCameraGO = targetCamera.gameObject;
+            var potentialImageEffects = s_ExistingSceneMainCamera.GetComponents<MonoBehaviour>();
+            var enabledPotentialImageEffects = potentialImageEffects.Where(x => x != null && x.enabled);
+            var targetMethodNames = new [] {"OnRenderImage", "OnPreRender", "OnPostRender"};
+            var bindingFlags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            foreach (var potentialImageEffect in enabledPotentialImageEffects)
+            {
+                var componentInstanceType = potentialImageEffect.GetType();
+                var targetMethodFound = false;
+                for (int i = 0; i < targetMethodNames.Length; ++i)
+                {
+                    targetMethodFound = componentInstanceType.GetMethodRecursively(targetMethodNames[i], bindingFlags) != null;
+
+                    if (targetMethodFound)
+                        break;
+                }
+
+                // Copying of certain image effects can cause Unity to crash when copied
+                if (targetMethodFound)
+                    ObjectUtils.CopyComponent(potentialImageEffect, targetCameraGO);
+            }
         }
 
         public void OnDisable()
@@ -308,12 +348,53 @@ namespace UnityEditor.Experimental.EditorVR.Core
 
             DoDrawCamera(guiRect);
 
-            Event e = Event.current;
+            MouseScrollDelta = Vector2.zero;
+            var e = Event.current;
+            MouseDelta = e.delta;
+            switch (e.type)
+            {
+                case EventType.ScrollWheel:
+                    MouseScrollDelta = e.delta;
+                    break;
+                case EventType.MouseDown:
+                    switch (e.button)
+                    {
+                        case 0:
+                            LeftMouseButtonHeld = true;
+                            break;
+                        case 1:
+                            RightMouseButtonHeld = true;
+                            break;
+                        case 2:
+                            MiddleMouseButtonHeld = true;
+                            break;
+                    }
+                    break;
+                case EventType.MouseUp:
+                    switch (e.button)
+                    {
+                        case 0:
+                            LeftMouseButtonHeld = false;
+                            break;
+                        case 1:
+                            RightMouseButtonHeld = false;
+                            break;
+                        case 2:
+                            MiddleMouseButtonHeld = false;
+                            break;
+                    }
+                    break;
+            }
+
             if (m_ShowDeviceView)
             {
                 if (e.type == EventType.Repaint)
                 {
+#if UNITY_2018_1_OR_NEWER
+                    GL.sRGBWrite = false;
+#else
                     GL.sRGBWrite = (QualitySettings.activeColorSpace == ColorSpace.Linear);
+#endif
                     var renderTexture = customPreviewCamera && customPreviewCamera.targetTexture ? customPreviewCamera.targetTexture : m_TargetTexture;
                     GUI.DrawTexture(guiRect, renderTexture, ScaleMode.StretchToFill, false);
                     GL.sRGBWrite = false;
@@ -343,12 +424,19 @@ namespace UnityEditor.Experimental.EditorVR.Core
                 return;
 #endif
 
+#if UNITY_2018_1_OR_NEWER
+                GL.sRGBWrite = (QualitySettings.activeColorSpace == ColorSpace.Linear);
+#endif
+
             UnityEditor.Handles.DrawCamera(rect, m_Camera, m_RenderMode);
             if (Event.current.type == EventType.Repaint)
             {
                 GUI.matrix = Matrix4x4.identity; // Need to push GUI matrix back to GPU after camera rendering
                 RenderTexture.active = null; // Clean up after DrawCamera
             }
+#if UNITY_2018_1_OR_NEWER
+                GL.sRGBWrite = false;
+#endif
         }
 
         private void Update()
